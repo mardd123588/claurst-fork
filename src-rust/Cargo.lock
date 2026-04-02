@@ -477,6 +477,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "cc-api",
+ "cc-bridge",
  "cc-core",
  "cc-mcp",
  "cc-plugins",
@@ -485,7 +486,9 @@ dependencies = [
  "cc-tui",
  "chrono",
  "dirs",
+ "hostname",
  "open",
+ "qrcode",
  "regex",
  "reqwest",
  "serde",
@@ -536,6 +539,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cc-core",
+ "chrono",
  "dashmap",
  "dirs",
  "futures",
@@ -551,6 +555,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "urlencoding",
  "uuid",
 ]
 
@@ -623,6 +628,7 @@ dependencies = [
  "futures",
  "glob",
  "once_cell",
+ "open",
  "parking_lot",
  "regex",
  "reqwest",
@@ -2798,6 +2804,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+dependencies = [
+ "image",
 ]
 
 [[package]]

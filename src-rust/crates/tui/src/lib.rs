@@ -117,7 +117,7 @@ pub use agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentDefinition, 
 pub use stats_dialog::{StatsDialogState, StatsTab, load_stats, render_stats_dialog};
 pub use mcp_view::{McpViewState, McpServerView, McpToolView, McpViewStatus, render_mcp_view};
 pub use prompt_input::{PromptInputState, VimMode, VimPendingState, VimOperator, VimFindKind, InputMode, render_prompt_input, handle_paste, compute_typeahead};
-pub use model_picker::{ModelPickerState, ModelEntry, render_model_picker};
+pub use model_picker::{ModelPickerState, ModelEntry, EffortLevel, render_model_picker, model_supports_effort};
 pub use session_browser::{SessionBrowserState, SessionBrowserMode, SessionEntry, render_session_browser};
 pub use invalid_config_dialog::{InvalidConfigDialogState, InvalidConfigKind, render_invalid_config_dialog};
 pub use bypass_permissions_dialog::{BypassPermissionsDialogState, render_bypass_permissions_dialog};
@@ -454,9 +454,9 @@ mod tests {
         app.handle_key_event(key(KeyCode::Char('a')));
         app.handle_key_event(key(KeyCode::Tab));
 
-        assert_eq!(app.input, "/agents");
-        assert_eq!(app.prompt_input.text, "/agents");
-        assert_eq!(app.cursor_pos, "/agents".len());
+        assert_eq!(app.input, "/advisor");
+        assert_eq!(app.prompt_input.text, "/advisor");
+        assert_eq!(app.cursor_pos, "/advisor".len());
     }
 
     #[test]

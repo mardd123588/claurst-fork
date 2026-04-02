@@ -1364,23 +1364,51 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // PR badge
+        // PR badge — shows "PR #<n>" in cyan, with optional state in brackets.
+        // State color: approved=green, changes_requested=red,
+        //              review_required=yellow, else=gray.
         if let Some(pr_num) = app.pr_number {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            let pr_label = match &app.pr_state {
+                Some(state) => format!("PR #{} [{}]", pr_num, state),
+                None => format!("PR #{}", pr_num),
+            };
+            let pr_color = match app.pr_state.as_deref() {
+                Some("approved") => Color::Green,
+                Some("changes_requested") => Color::Red,
+                Some("review_required") => Color::Yellow,
+                Some(_) => Color::Gray,
+                None => Color::Cyan,
+            };
             spans.push(Span::styled(
-                format!(" #{}", pr_num),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                pr_label,
+                Style::default().fg(pr_color).add_modifier(Modifier::BOLD),
             ));
         }
 
-        // Background task status pill
-        if let Some(ref task_status) = app.background_task_status {
+        // Background task status pill — shows "⟳ N tasks" when count > 0.
+        // Falls back to background_task_status pre-formatted string if set.
+        if app.background_task_count > 0 {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            let label = if app.background_task_count == 1 {
+                "\u{27f3} 1 task".to_string()
+            } else {
+                format!("\u{27f3} {} tasks", app.background_task_count)
+            };
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if let Some(ref task_status) = app.background_task_status {
             if !spans.is_empty() {
                 spans.push(Span::raw("  "));
             }
             spans.push(Span::styled(
-                format!("⟳ {}", task_status),
+                format!("\u{27f3} {}", task_status),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -2009,3 +2037,160 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
         .render(area, buf);
 }
 
+
+// ---------------------------------------------------------------------------
+// Multi-agent UI components
+// ---------------------------------------------------------------------------
+
+/// Render a single progress-indicator row for a sub-agent.
+///
+/// Format: `[agent-<id>]` in cyan dim · space · status in colour · ` · ` · tool in dim gray
+///
+/// # Arguments
+/// * `agent_id`    — short agent identifier (e.g. `"abc123"`)
+/// * `status`      — current status string: `"working"`, `"done"`, `"error"`, or other
+/// * `current_tool` — tool the agent is currently executing, if any
+pub fn render_agent_progress_line(
+    agent_id: &str,
+    status: &str,
+    current_tool: Option<&str>,
+) -> Line<'static> {
+    let status_color = match status {
+        "working" | "running" => Color::Yellow,
+        "done" | "complete" | "completed" => Color::Green,
+        "error" | "failed" => Color::Red,
+        _ => Color::DarkGray,
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            format!("[agent-{}]", agent_id),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            status.to_string(),
+            Style::default().fg(status_color),
+        ),
+    ];
+
+    if let Some(tool) = current_tool {
+        spans.push(Span::styled(
+            " · ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            tool.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+/// Render a multi-line coordinator status block for a multi-agent session.
+///
+/// Returns a `Vec<Line>` containing:
+/// 1. A header: `Coordinator · N agents (M active)` in cyan bold
+/// 2. One compact row per entry in `active_agents` using [`render_agent_progress_line`]
+///
+/// # Arguments
+/// * `agent_count`   — total number of sub-agents spawned
+/// * `completed`     — number of agents that have finished
+/// * `active_agents` — slice of agent ID strings currently running
+pub fn render_coordinator_status_lines(
+    agent_count: usize,
+    completed: usize,
+    active_agents: &[&str],
+) -> Vec<Line<'static>> {
+    let active_count = active_agents.len();
+
+    let header = Line::from(vec![
+        Span::styled(
+            "Coordinator".to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " · ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("{} agent{}", agent_count, if agent_count == 1 { "" } else { "s" }),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!(" ({} active)", active_count),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if completed > 0 {
+                format!("  ✔ {} done", completed)
+            } else {
+                String::new()
+            },
+            Style::default().fg(Color::Green),
+        ),
+    ]);
+
+    let mut lines = vec![header];
+
+    for agent_id in active_agents {
+        let row = render_agent_progress_line(agent_id, "working", None);
+        // Indent agent rows by two spaces
+        let mut indented_spans = vec![Span::raw("  ")];
+        indented_spans.extend(row.spans);
+        lines.push(Line::from(indented_spans));
+    }
+
+    lines
+}
+
+/// Render a single header line for a teammate's message block.
+///
+/// Format: `┤ teammate: <id> ├` in magenta, optional `· <session_info>` in dim
+///
+/// # Arguments
+/// * `teammate_id`  — teammate identifier string
+/// * `session_info` — optional session info snippet to append
+pub fn render_teammate_header(
+    teammate_id: &str,
+    session_info: Option<&str>,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            "┤ teammate: ".to_string(),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled(
+            teammate_id.to_string(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ├".to_string(),
+            Style::default().fg(Color::Magenta),
+        ),
+    ];
+
+    if let Some(info) = session_info {
+        spans.push(Span::styled(
+            "  · ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            info.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
+}

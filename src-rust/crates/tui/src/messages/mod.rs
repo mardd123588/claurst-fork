@@ -789,6 +789,31 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     ctx.width,
                 ));
             }
+            ContentBlock::UserLocalCommandOutput { command, output } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_user_local_command_output(&command, &output, 30));
+            }
+            ContentBlock::UserCommand { name, args } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_user_command(&name, &args));
+            }
+            ContentBlock::UserMemoryInput { key, value } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_user_memory_input(&key, &value));
+            }
+            ContentBlock::SystemAPIError { message, retry_secs } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_system_api_error(&message, retry_secs));
+            }
+            ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+                lines.extend(render_collapsed_read_search(&tool_name, &path_refs, n_hidden));
+            }
+            ContentBlock::TaskAssignment { id, subject, description } => {
+                flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
+                lines.extend(render_task_assignment(&id, &subject, &description));
+            }
         }
     }
 

@@ -5,7 +5,7 @@ use crate::context_viz::ContextVizState;
 use crate::export_dialog::{ExportDialogState, ExportFormat};
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
-use crate::model_picker::ModelPickerState;
+use crate::model_picker::{EffortLevel, ModelPickerState, FAST_MODE_MODEL};
 use crate::session_browser::SessionBrowserState;
 use crate::dialogs::McpApprovalDialogState;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("advisor", "Set or unset the server-side advisor model"),
     ("agents", "Browse agent definitions and active agents"),
     ("changes", "Inspect changes from the current session"),
     ("clear", "Clear the conversation transcript"),
@@ -54,9 +55,12 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("export", "Export conversation"),
     ("fast", "Toggle fast mode"),
     ("feedback", "Open session feedback survey"),
+    ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
     ("init", "Initialize CLAUDE.md for this project"),
+    ("insights", "Generate a session analysis report with conversation statistics"),
+    ("install-slack-app", "Install the Claude Code Slack integration"),
     ("keybindings", "Show keybinding configuration"),
     ("login", "Log in to Claude"),
     ("logout", "Log out of Claude"),
@@ -64,6 +68,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("memory", "Browse and open CLAUDE.md memory files"),
     ("model", "Change the AI model"),
     ("output-style", "Toggle output style (auto/stream/verbose)"),
+    ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("privacy", "Open privacy settings"),
     ("quit", "Quit Claude Code"),
     ("rename", "Rename this session"),
@@ -75,6 +80,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
+    ("ultrareview", "Run an exhaustive multi-dimensional code review"),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
@@ -82,41 +88,6 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
-
-/// Effort level indicator shown in the status bar.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EffortLevel {
-    Low,    // ○
-    Medium, // ◐
-    High,   // ●
-    Max,    // ◉  (Opus 4.6 only)
-}
-
-impl Default for EffortLevel {
-    fn default() -> Self {
-        Self::High
-    }
-}
-
-impl EffortLevel {
-    pub fn glyph(&self) -> &'static str {
-        match self {
-            Self::Low => "○",
-            Self::Medium => "◐",
-            Self::High => "●",
-            Self::Max => "◉",
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Max => "max",
-        }
-    }
-}
 
 /// Visual style for inline system messages in the conversation pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,6 +310,10 @@ pub struct App {
     pub token_count: u32,
     pub cost_usd: f64,
     pub model_name: String,
+    /// Current effort level (controls extended-thinking budget_tokens).
+    pub effort_level: EffortLevel,
+    /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
+    pub fast_mode: bool,
     pub agent_status: Vec<(String, String)>,
     pub history_search: Option<HistorySearch>,
     pub keybindings: KeybindingResolver,
@@ -408,10 +383,6 @@ pub struct App {
 
     /// Plan mode — input border turns blue, [PLAN] shown in status bar.
     pub plan_mode: bool,
-    /// Fast mode — lightning bolt shown before model name, border turns yellow.
-    pub fast_mode: bool,
-    /// Effort level shown as ○/◐/●/◉ in the status bar next to the model name.
-    pub effort_level: EffortLevel,
     /// "While you were away" summary text shown on the welcome screen.
     pub away_summary: Option<String>,
     /// When streaming stalled (used to turn the spinner red after 3 s).
@@ -476,6 +447,10 @@ pub struct App {
     pub pr_number: Option<u32>,
     /// PR URL for the current branch.
     pub pr_url: Option<String>,
+    /// PR review state: "approved", "changes_requested", "review_required", etc.
+    pub pr_state: Option<String>,
+    /// Count of in-progress background tasks (drives the footer pill).
+    pub background_task_count: usize,
     /// Background task status text shown in footer pill.
     pub background_task_status: Option<String>,
     /// External status line command output (from CLAUDE_STATUS_COMMAND).
@@ -493,6 +468,10 @@ pub struct App {
     pub voice_recording: bool,
     /// Receiver for VoiceEvent messages produced by the recorder task.
     pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<cc_core::voice::VoiceEvent>>,
+    /// Receiver for model-list results fetched in the background when the
+    /// /model picker opens.  Drained each frame so models appear as soon as
+    /// the fetch completes.
+    pub model_fetch_rx: Option<tokio::sync::mpsc::Receiver<Vec<crate::model_picker::ModelEntry>>>,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -534,6 +513,13 @@ pub struct App {
     scroll_accel: f32,
     /// Timestamp of the last scroll event (for burst detection).
     scroll_last_time: Option<std::time::Instant>,
+
+    // ---- Bash prefix allowlist -------------------------------------------
+    /// Command prefixes that have been permanently allowed this session via
+    /// the "Allow commands starting with X" option in the bash permission dialog.
+    /// Before showing the dialog for a bash command, the first whitespace-delimited
+    /// word is checked against this set; a match silently auto-approves the request.
+    pub bash_prefix_allowlist: std::collections::HashSet<String>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -622,6 +608,8 @@ impl App {
             token_count: 0,
             cost_usd: 0.0,
             model_name,
+            effort_level: EffortLevel::Normal,
+            fast_mode: false,
             agent_status: Vec::new(),
             history_search: None,
             keybindings: KeybindingResolver::new(&user_keybindings),
@@ -649,8 +637,6 @@ impl App {
             file_history: None,
             current_turn: None,
             plan_mode: false,
-            fast_mode: false,
-            effort_level: EffortLevel::default(),
             away_summary: None,
             stall_start: None,
             settings_screen: SettingsScreen::new(),
@@ -680,6 +666,8 @@ impl App {
             output_style: "auto".to_string(),
             pr_number: None,
             pr_url: None,
+            pr_state: None,
+            background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
             auto_compact_enabled: false,
@@ -712,6 +700,7 @@ impl App {
             },
             voice_recording: false,
             voice_event_rx: None,
+            model_fetch_rx: None,
             context_window_size: 0,
             context_used_tokens: 0,
             rate_limit_5h_pct: None,
@@ -728,6 +717,7 @@ impl App {
             selection_text: RefCell::new(String::new()),
             scroll_accel: 3.0,
             scroll_last_time: None,
+            bash_prefix_allowlist: std::collections::HashSet::new(),
         }
     }
 
@@ -818,8 +808,27 @@ impl App {
                 true
             }
             "model" => {
-                let current = &self.model_name.clone();
-                self.model_picker.open(current);
+                let current = self.model_name.clone();
+                let effort = self.effort_level;
+                let fast = self.fast_mode;
+                self.model_picker.open_with_state(&current, effort, fast);
+
+                // Kick off a background fetch of the model list if we don't
+                // already have a fresh list and aren't already loading.
+                if !self.model_picker.models_loaded && !self.model_picker.loading_models {
+                    if let Ok(client) = cc_api::AnthropicClient::from_config(&self.config) {
+                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                        self.model_fetch_rx = Some(rx);
+                        self.model_picker.loading_models = true;
+                        tokio::spawn(async move {
+                            let entries =
+                                crate::model_picker::ModelPickerState::fetch_models(&client)
+                                    .await;
+                            let _ = tx.send(entries).await;
+                        });
+                    }
+                }
+
                 true
             }
             "session" | "resume" => {
@@ -916,14 +925,14 @@ impl App {
                 // Only cycle the visual indicator when called with no args (arg-based
                 // effort changes are handled by execute_command + main.rs sync).
                 self.effort_level = match self.effort_level {
-                    EffortLevel::Low => EffortLevel::Medium,
-                    EffortLevel::Medium => EffortLevel::High,
+                    EffortLevel::Low => EffortLevel::Normal,
+                    EffortLevel::Normal => EffortLevel::High,
                     EffortLevel::High => EffortLevel::Max,
                     EffortLevel::Max => EffortLevel::Low,
                 };
                 self.status_message = Some(format!(
                     "Effort: {} {}",
-                    self.effort_level.glyph(),
+                    self.effort_level.symbol(),
                     self.effort_level.label(),
                 ));
                 true
@@ -978,6 +987,14 @@ impl App {
                 // Open settings on KeyBindings tab
                 self.settings_screen.open();
                 self.settings_screen.active_tab = crate::settings_screen::SettingsTab::KeyBindings;
+                true
+            }
+            "help" => {
+                // Open the help overlay (same as pressing `?` or F1).
+                if !self.help_overlay.visible {
+                    self.show_help = true;
+                    self.help_overlay.toggle();
+                }
                 true
             }
             _ => false,
@@ -1406,6 +1423,11 @@ impl App {
         if let Ok(url) = std::env::var("CLAUDE_PR_URL") {
             self.pr_url = Some(url);
         }
+        if let Ok(state) = std::env::var("CLAUDE_PR_STATE") {
+            if !state.trim().is_empty() {
+                self.pr_state = Some(state.trim().to_string());
+            }
+        }
         // Fall back to gh CLI if no env vars
         if self.pr_number.is_none() {
             if let Ok(output) = std::process::Command::new("gh")
@@ -1560,10 +1582,21 @@ impl App {
                 KeyCode::Esc => self.model_picker.close(),
                 KeyCode::Up => self.model_picker.select_prev(),
                 KeyCode::Down => self.model_picker.select_next(),
+                KeyCode::Left => self.model_picker.effort_prev(),
+                KeyCode::Right => self.model_picker.effort_next(),
                 KeyCode::Enter => {
-                    if let Some(model_id) = self.model_picker.confirm() {
+                    if let Some((model_id, effort)) = self.model_picker.confirm() {
+                        // If user picked a model other than the fast-mode model
+                        // while fast mode was active, turn fast mode off.
+                        if self.fast_mode && model_id != FAST_MODE_MODEL {
+                            self.fast_mode = false;
+                        }
+                        if let Some(e) = effort {
+                            self.effort_level = e;
+                        }
                         self.set_model(model_id.clone());
-                        self.status_message = Some(format!("Model: {}", model_id));
+                        let effort_hint = effort.map(|e| format!(" [{}]", e.label())).unwrap_or_default();
+                        self.status_message = Some(format!("Model: {}{}", model_id, effort_hint));
                     }
                 }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
@@ -1701,9 +1734,10 @@ impl App {
         // Hooks config menu intercepts navigation and Esc
         if self.hooks_config_menu.visible {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.hooks_config_menu.close(),
-                KeyCode::Up => self.hooks_config_menu.select_prev(),
-                KeyCode::Down => self.hooks_config_menu.select_next(),
+                KeyCode::Esc | KeyCode::Char('q') => self.hooks_config_menu.back(),
+                KeyCode::Enter => self.hooks_config_menu.enter(),
+                KeyCode::Up | KeyCode::Char('k') => self.hooks_config_menu.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.hooks_config_menu.select_next(),
                 _ => {}
             }
             return false;
@@ -2367,6 +2401,15 @@ impl App {
                     hs.update_matches(&history);
                 }
             }
+            // 'p' with no modifiers and an empty query = pin/unpin the selected entry.
+            // When the query is non-empty 'p' is treated as a filter character so
+            // the user can still search for prompts containing the letter 'p'.
+            KeyCode::Char('p')
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.history_search_overlay.query.is_empty() =>
+            {
+                self.history_search_overlay.toggle_pin();
+            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
@@ -2653,16 +2696,26 @@ impl App {
                         pr.selected_option = idx;
                     }
                 } else {
+                    // Check if any option matches this key.
+                    let mut matched_idx = None;
                     for (i, opt) in pr.options.iter().enumerate() {
                         if opt.key == c {
-                            pr.selected_option = i;
-                            self.permission_request = None;
-                            return;
+                            matched_idx = Some(i);
+                            break;
                         }
+                    }
+                    if let Some(idx) = matched_idx {
+                        pr.selected_option = idx;
+                        // If this is the prefix-allow option ('P'), record the prefix.
+                        self.maybe_record_bash_prefix();
+                        self.permission_request = None;
+                        return;
                     }
                 }
             }
             KeyCode::Enter => {
+                // If the currently selected option is the prefix-allow option, record it.
+                self.maybe_record_bash_prefix();
                 self.permission_request = None;
             }
             KeyCode::Up => {
@@ -2682,6 +2735,40 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// If the active permission dialog's selected option is the prefix-allow
+    /// option ('P') for a Bash dialog, extract the suggested prefix and add it
+    /// to `bash_prefix_allowlist` so future requests with the same prefix are
+    /// silently approved.
+    fn maybe_record_bash_prefix(&mut self) {
+        use crate::dialogs::PermissionDialogKind;
+        let pr = match self.permission_request.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+        // Only act on Bash dialogs where the selected option key is 'P'.
+        let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
+        if selected_key != Some('P') {
+            return;
+        }
+        if let PermissionDialogKind::Bash { command, .. } = &pr.kind {
+            // Always normalize to the first whitespace-delimited word so
+            // that the allowlist check in `bash_command_allowed_by_prefix`
+            // (which also uses `split_whitespace().next()`) matches correctly.
+            let first_word = command.split_whitespace().next().unwrap_or("").to_string();
+            if !first_word.is_empty() {
+                self.bash_prefix_allowlist.insert(first_word);
+            }
+        }
+    }
+
+    /// Returns `true` if the given bash `command` is covered by the session-local
+    /// prefix allowlist (i.e. its first word matches an entry in
+    /// `bash_prefix_allowlist`).  Used by callers to skip the permission dialog.
+    pub fn bash_command_allowed_by_prefix(&self, command: &str) -> bool {
+        let first_word = command.split_whitespace().next().unwrap_or("");
+        !first_word.is_empty() && self.bash_prefix_allowlist.contains(first_word)
     }
 
     // -------------------------------------------------------------------
@@ -2878,6 +2965,19 @@ impl App {
             // Expire old notifications
             self.notifications.tick();
 
+            // Drain background model-fetch results (non-blocking).
+            if let Some(ref mut rx) = self.model_fetch_rx {
+                if let Ok(entries) = rx.try_recv() {
+                    let current = self.model_name.clone();
+                    self.model_picker.set_models(entries);
+                    // Re-apply the current-model highlight so it stays accurate.
+                    for m in &mut self.model_picker.models {
+                        m.is_current = m.id == current;
+                    }
+                    self.model_fetch_rx = None;
+                }
+            }
+
             // Draw the frame
             terminal.draw(|f| render::render_app(f, self))?;
 
@@ -3046,5 +3146,130 @@ mod tests {
         assert_eq!(app.output_style, "verbose");
         assert!(app.intercept_slash_command("output-style"));
         assert_eq!(app.output_style, "auto");
+    }
+
+    // ---- Help overlay -------------------------------------------------------
+
+    #[test]
+    fn test_help_slash_command_opens_overlay() {
+        let mut app = make_app();
+        assert!(!app.help_overlay.visible);
+        assert!(!app.show_help);
+        assert!(app.intercept_slash_command("help"));
+        assert!(app.help_overlay.visible);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn test_help_slash_command_is_idempotent_when_already_open() {
+        let mut app = make_app();
+        // First call opens it.
+        assert!(app.intercept_slash_command("help"));
+        assert!(app.help_overlay.visible);
+        // Second call while already open should leave it open (not toggle it off).
+        assert!(app.intercept_slash_command("help"));
+        assert!(app.help_overlay.visible);
+    }
+
+    // ---- Bash prefix allowlist ----------------------------------------------
+
+    #[test]
+    fn test_bash_command_not_allowed_by_default() {
+        let app = make_app();
+        assert!(!app.bash_command_allowed_by_prefix("git status"));
+        assert!(!app.bash_command_allowed_by_prefix("ls -la"));
+        assert!(!app.bash_command_allowed_by_prefix(""));
+    }
+
+    #[test]
+    fn test_bash_prefix_allowlist_after_p_key() {
+        use crate::dialogs::PermissionRequest;
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        let mut app = make_app();
+        // Set up a bash permission dialog with a suggested prefix.
+        let pr = PermissionRequest::bash(
+            "tu-1".to_string(),
+            "Bash".to_string(),
+            "wants to run".to_string(),
+            "git status".to_string(),
+            Some("git".to_string()),
+        );
+        app.permission_request = Some(pr);
+
+        // Simulate pressing 'P' (prefix-allow key).
+        let key = KeyEvent {
+            code: KeyCode::Char('P'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_permission_key(key);
+
+        // Dialog should be dismissed and "git" added to the allowlist.
+        assert!(app.permission_request.is_none());
+        assert!(app.bash_command_allowed_by_prefix("git status"));
+        assert!(app.bash_command_allowed_by_prefix("git push origin main"));
+        // Other commands should NOT be allowed.
+        assert!(!app.bash_command_allowed_by_prefix("rm -rf /tmp"));
+    }
+
+    #[test]
+    fn test_bash_prefix_allowlist_via_enter_on_p_option() {
+        use crate::dialogs::PermissionRequest;
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        let mut app = make_app();
+        let mut pr = PermissionRequest::bash(
+            "tu-2".to_string(),
+            "Bash".to_string(),
+            "wants to run".to_string(),
+            "cargo build".to_string(),
+            Some("cargo".to_string()),
+        );
+        // Navigate to the prefix option (index 3 in a 5-option dialog).
+        pr.selected_option = 3;
+        app.permission_request = Some(pr);
+
+        // Press Enter to confirm the currently selected (prefix) option.
+        let key = KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_permission_key(key);
+
+        assert!(app.permission_request.is_none());
+        assert!(app.bash_command_allowed_by_prefix("cargo test"));
+        assert!(!app.bash_command_allowed_by_prefix("make build"));
+    }
+
+    #[test]
+    fn test_bash_prefix_allowlist_non_prefix_option_does_not_add() {
+        use crate::dialogs::PermissionRequest;
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        let mut app = make_app();
+        let pr = PermissionRequest::bash(
+            "tu-3".to_string(),
+            "Bash".to_string(),
+            "wants to run".to_string(),
+            "npm install".to_string(),
+            Some("npm".to_string()),
+        );
+        app.permission_request = Some(pr);
+
+        // Press 'y' (allow-once) — should NOT add to allowlist.
+        let key = KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_permission_key(key);
+
+        assert!(app.permission_request.is_none());
+        assert!(!app.bash_command_allowed_by_prefix("npm test"));
     }
 }

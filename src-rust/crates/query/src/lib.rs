@@ -529,6 +529,14 @@ pub async fn run_query_loop(
             req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
         }
 
+        // Apply temperature: explicit config value takes precedence, then effort-level override.
+        let effective_temperature = config.temperature.or_else(|| {
+            config.effort_level.and_then(|el| el.temperature())
+        });
+        if let Some(t) = effective_temperature {
+            req_builder = req_builder.temperature(t);
+        }
+
         let request = req_builder.build();
 
         // Create a stream handler that forwards to the event channel
@@ -732,6 +740,7 @@ pub async fn run_query_loop(
                     client,
                     config,
                     cancel_token.clone(),
+                    &[],
                 )
                 .await
                 {

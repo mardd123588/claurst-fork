@@ -180,9 +180,45 @@ struct Cli {
     #[arg(long = "prefill")]
     prefill: Option<String>,
 
+    /// Effort level for extended thinking (low, medium, high, max)
+    #[arg(long = "effort", value_name = "LEVEL")]
+    effort: Option<String>,
+
     /// Extended thinking budget in tokens (enables extended thinking)
     #[arg(long = "thinking", value_name = "TOKENS")]
     thinking: Option<u32>,
+
+    /// Continue the most recent conversation
+    #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
+    continue_session: bool,
+
+    /// Override system prompt from a file
+    #[arg(long = "system-prompt-file")]
+    system_prompt_file: Option<PathBuf>,
+
+    /// Tools to allow (comma-separated, default: all)
+    #[arg(long = "allowed-tools", value_name = "TOOLS")]
+    allowed_tools: Option<String>,
+
+    /// Tools to disallow (comma-separated)
+    #[arg(long = "disallowed-tools", value_name = "TOOLS")]
+    disallowed_tools: Option<String>,
+
+    /// Extra beta feature headers to send (comma-separated)
+    #[arg(long = "betas", value_name = "HEADERS")]
+    betas: Option<String>,
+
+    /// Disable all slash commands
+    #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
+    disable_slash_commands: bool,
+
+    /// Run in bare mode (no hooks, no plugins, no CLAUDE.md)
+    #[arg(long = "bare", action = ArgAction::SetTrue)]
+    bare: bool,
+
+    /// Billing workload tag
+    #[arg(long = "workload", value_name = "TAG")]
+    workload: Option<String>,
 
     /// Maximum spend in USD before aborting the query loop
     #[arg(long = "max-budget-usd", value_name = "USD")]
@@ -541,6 +577,13 @@ async fn main() -> anyhow::Result<()> {
     query_config.working_directory = Some(cwd.display().to_string());
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
+    }
+    if let Some(ref level_str) = cli.effort {
+        if let Some(level) = cc_core::effort::EffortLevel::from_str(level_str) {
+            query_config.effort_level = Some(level);
+        } else {
+            eprintln!("Warning: unknown effort level '{}' — expected low/medium/high/max", level_str);
+        }
     }
     if let Some(usd) = cli.max_budget_usd {
         query_config.max_budget_usd = Some(usd);
@@ -941,6 +984,16 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
+    if let Some(level) = base_query_config.effort_level {
+        use cc_tui::EffortLevel as TuiEL;
+        app.effort_level = match level {
+            cc_core::effort::EffortLevel::Low    => TuiEL::Low,
+            cc_core::effort::EffortLevel::Medium => TuiEL::Normal,
+            cc_core::effort::EffortLevel::High   => TuiEL::High,
+            cc_core::effort::EffortLevel::Max    => TuiEL::Max,
+        };
+    }
     app.config.project_dir = Some(tool_ctx.working_dir.clone());
     app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
     if let Some(manager) = tool_ctx.mcp_manager.clone() {
@@ -1159,13 +1212,13 @@ async fn run_interactive(
                             // (no-args /effort → cycle Low→Med→High→Max→Low).
                             if handled_by_tui && cmd_name == "effort" && cmd_args.is_empty() {
                                 current_effort = Some(match app.effort_level {
-                                    cc_tui::app::EffortLevel::Low =>
+                                    cc_tui::EffortLevel::Low =>
                                         cc_core::effort::EffortLevel::Low,
-                                    cc_tui::app::EffortLevel::Medium =>
+                                    cc_tui::EffortLevel::Normal =>
                                         cc_core::effort::EffortLevel::Medium,
-                                    cc_tui::app::EffortLevel::High =>
+                                    cc_tui::EffortLevel::High =>
                                         cc_core::effort::EffortLevel::High,
-                                    cc_tui::app::EffortLevel::Max =>
+                                    cc_tui::EffortLevel::Max =>
                                         cc_core::effort::EffortLevel::Max,
                                 });
                             }
@@ -1350,17 +1403,17 @@ async fn run_interactive(
                                     current_effort = Some(level);
                                     app.effort_level = match level {
                                         cc_core::effort::EffortLevel::Low =>
-                                            cc_tui::app::EffortLevel::Low,
+                                            cc_tui::EffortLevel::Low,
                                         cc_core::effort::EffortLevel::Medium =>
-                                            cc_tui::app::EffortLevel::Medium,
+                                            cc_tui::EffortLevel::Normal,
                                         cc_core::effort::EffortLevel::High =>
-                                            cc_tui::app::EffortLevel::High,
+                                            cc_tui::EffortLevel::High,
                                         cc_core::effort::EffortLevel::Max =>
-                                            cc_tui::app::EffortLevel::Max,
+                                            cc_tui::EffortLevel::Max,
                                     };
                                     app.status_message = Some(format!(
                                         "Effort: {} {}",
-                                        app.effort_level.glyph(),
+                                        app.effort_level.symbol(),
                                         app.effort_level.label(),
                                     ));
                                 }
